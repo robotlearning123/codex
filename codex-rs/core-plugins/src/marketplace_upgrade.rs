@@ -23,6 +23,7 @@ use tracing::warn;
 
 const INSTALLED_MARKETPLACES_DIR: &str = ".tmp/marketplaces";
 const MARKETPLACE_UPGRADE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_MARKETPLACE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredMarketplaceUpgradeError {
@@ -75,6 +76,7 @@ pub fn upgrade_configured_git_marketplaces(
     }
 
     let install_root = marketplace_install_root(codex_home);
+    remove_stale_marketplace_temp_dirs(&install_root);
     let selected_marketplaces = marketplaces
         .iter()
         .map(|marketplace| marketplace.name.clone())
@@ -295,4 +297,127 @@ fn read_configured_git_marketplace(
         marketplace_name.to_string(),
         marketplace,
     ))
+}
+
+/// Remove orphaned staging directories left behind by previous marketplace
+/// upgrade or add operations that were interrupted (e.g. process crash, kill).
+pub(super) fn remove_stale_marketplace_temp_dirs(install_root: &Path) {
+    let staging_parent = install_root.join(".staging");
+    if !staging_parent.is_dir() {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(&staging_parent) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                error = %err,
+                path = %staging_parent.display(),
+                "failed to list marketplace staging directory for stale cleanup"
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %entry.path().display(),
+                    "failed to inspect marketplace staging entry"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_staging_dir = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("marketplace-upgrade-") || name.starts_with("marketplace-add-")
+            });
+        if !is_staging_dir {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to read marketplace staging directory metadata"
+                );
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to read marketplace staging directory modification time"
+                );
+                continue;
+            }
+        };
+        let age = match modified.elapsed() {
+            Ok(age) => age,
+            Err(_) => continue,
+        };
+        if age < STALE_MARKETPLACE_TEMP_DIR_MAX_AGE {
+            continue;
+        }
+
+        if let Err(err) = std::fs::remove_dir_all(&path) {
+            warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to remove stale marketplace staging directory"
+            );
+        }
+    }
+
+    // Clean up orphaned marketplace-backup-* directories at the install root level.
+    if let Ok(entries) = std::fs::read_dir(install_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_backup_dir = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("marketplace-backup-"));
+            if !is_backup_dir {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = match metadata.modified() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let age = match modified.elapsed() {
+                Ok(age) => age,
+                Err(_) => continue,
+            };
+            if age < STALE_MARKETPLACE_TEMP_DIR_MAX_AGE {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to remove stale marketplace backup directory"
+                );
+            }
+        }
+    }
 }

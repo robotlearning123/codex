@@ -1,5 +1,6 @@
 use crate::OPENAI_CURATED_MARKETPLACE_NAME;
 use crate::installed_marketplaces::marketplace_install_root;
+use crate::marketplace_upgrade::remove_stale_marketplace_temp_dirs;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::fs;
 use std::path::Path;
@@ -94,6 +95,7 @@ where
     }
 
     let install_root = marketplace_install_root(codex_home);
+    remove_stale_marketplace_temp_dirs(&install_root);
     fs::create_dir_all(&install_root).map_err(|err| {
         MarketplaceAddError::Internal(format!(
             "failed to create marketplace install directory {}: {err}",
