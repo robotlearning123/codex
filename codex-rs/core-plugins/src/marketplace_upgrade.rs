@@ -23,6 +23,7 @@ use tracing::warn;
 
 const INSTALLED_MARKETPLACES_DIR: &str = ".tmp/marketplaces";
 const MARKETPLACE_UPGRADE_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const STALE_MARKETPLACE_TEMP_DIR_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredMarketplaceUpgradeError {
@@ -75,6 +76,7 @@ pub fn upgrade_configured_git_marketplaces(
     }
 
     let install_root = marketplace_install_root(codex_home);
+    remove_stale_marketplace_temp_dirs(&install_root);
     let selected_marketplaces = marketplaces
         .iter()
         .map(|marketplace| marketplace.name.clone())
@@ -295,4 +297,216 @@ fn read_configured_git_marketplace(
         marketplace_name.to_string(),
         marketplace,
     ))
+}
+
+/// Remove orphaned staging directories left behind by previous marketplace
+/// upgrade or add operations that were interrupted (e.g. process crash, kill).
+pub(super) fn remove_stale_marketplace_temp_dirs(install_root: &Path) {
+    let staging_parent = install_root.join(".staging");
+    if !staging_parent.is_dir() {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(&staging_parent) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                error = %err,
+                path = %staging_parent.display(),
+                "failed to list marketplace staging directory for stale cleanup"
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %entry.path().display(),
+                    "failed to inspect marketplace staging entry"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_staging_dir = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("marketplace-upgrade-") || name.starts_with("marketplace-add-")
+            });
+        if !is_staging_dir {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to read marketplace staging directory metadata"
+                );
+                continue;
+            }
+        };
+        let modified = match metadata.modified() {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to read marketplace staging directory modification time"
+                );
+                continue;
+            }
+        };
+        let age = match modified.elapsed() {
+            Ok(age) => age,
+            Err(_) => continue,
+        };
+        if age < STALE_MARKETPLACE_TEMP_DIR_MAX_AGE {
+            continue;
+        }
+
+        if let Err(err) = std::fs::remove_dir_all(&path) {
+            warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to remove stale marketplace staging directory"
+            );
+        }
+    }
+
+    // Clean up orphaned marketplace-backup-* directories at the install root level.
+    if let Ok(entries) = std::fs::read_dir(install_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_backup_dir = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("marketplace-backup-"));
+            if !is_backup_dir {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = match metadata.modified() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let age = match modified.elapsed() {
+                Ok(age) => age,
+                Err(_) => continue,
+            };
+            if age < STALE_MARKETPLACE_TEMP_DIR_MAX_AGE {
+                continue;
+            }
+            if let Err(err) = std::fs::remove_dir_all(&path) {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to remove stale marketplace backup directory"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_removes_old_staging_dirs() {
+        let install_root = TempDir::new().unwrap();
+        let staging = install_root.path().join(".staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // Create a stale marketplace-upgrade-* dir with an old mtime
+        let old_upgrade = staging.join("marketplace-upgrade-aaaaaa");
+        fs::create_dir_all(&old_upgrade).unwrap();
+        set_mtime_past(&old_upgrade, Duration::from_secs(11 * 60));
+
+        // Create a stale marketplace-add-* dir with an old mtime
+        let old_add = staging.join("marketplace-add-bbbbbb");
+        fs::create_dir_all(&old_add).unwrap();
+        set_mtime_past(&old_add, Duration::from_secs(11 * 60));
+
+        // Create a fresh staging dir that should NOT be removed
+        let fresh_upgrade = staging.join("marketplace-upgrade-cccccc");
+        fs::create_dir_all(&fresh_upgrade).unwrap();
+
+        // Create an unrelated dir that should NOT be removed
+        let unrelated = staging.join("other-dir");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        remove_stale_marketplace_temp_dirs(install_root.path());
+
+        assert!(!old_upgrade.exists(), "old upgrade dir should be removed");
+        assert!(!old_add.exists(), "old add dir should be removed");
+        assert!(
+            fresh_upgrade.exists(),
+            "fresh upgrade dir should be preserved"
+        );
+        assert!(unrelated.exists(), "unrelated dir should be preserved");
+    }
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_removes_old_backup_dirs() {
+        let install_root = TempDir::new().unwrap();
+
+        let old_backup = install_root.path().join("marketplace-backup-xxxxxx");
+        fs::create_dir_all(&old_backup).unwrap();
+        set_mtime_past(&old_backup, Duration::from_secs(11 * 60));
+
+        let fresh_backup = install_root.path().join("marketplace-backup-yyyyyy");
+        fs::create_dir_all(&fresh_backup).unwrap();
+
+        // A normal installed marketplace dir should not be touched
+        let normal_dir = install_root.path().join("my-marketplace");
+        fs::create_dir_all(&normal_dir).unwrap();
+
+        remove_stale_marketplace_temp_dirs(install_root.path());
+
+        assert!(!old_backup.exists(), "old backup dir should be removed");
+        assert!(
+            fresh_backup.exists(),
+            "fresh backup dir should be preserved"
+        );
+        assert!(normal_dir.exists(), "normal dir should be preserved");
+    }
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_noop_when_no_staging_dir() {
+        let install_root = TempDir::new().unwrap();
+        // No .staging dir exists — should not panic
+        remove_stale_marketplace_temp_dirs(install_root.path());
+    }
+
+    /// Set a directory's mtime to `duration` in the past.
+    fn set_mtime_past(path: &Path, duration: Duration) {
+        let secs = duration.as_secs();
+        let status = std::process::Command::new("touch")
+            .arg(format!("-d@{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(secs)))
+            .arg(path)
+            .status()
+            .expect("touch command failed");
+        assert!(status.success(), "touch should succeed");
+    }
 }
