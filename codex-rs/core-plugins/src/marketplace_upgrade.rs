@@ -421,3 +421,92 @@ pub(super) fn remove_stale_marketplace_temp_dirs(install_root: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_removes_old_staging_dirs() {
+        let install_root = TempDir::new().unwrap();
+        let staging = install_root.path().join(".staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // Create a stale marketplace-upgrade-* dir with an old mtime
+        let old_upgrade = staging.join("marketplace-upgrade-aaaaaa");
+        fs::create_dir_all(&old_upgrade).unwrap();
+        set_mtime_past(&old_upgrade, Duration::from_secs(11 * 60));
+
+        // Create a stale marketplace-add-* dir with an old mtime
+        let old_add = staging.join("marketplace-add-bbbbbb");
+        fs::create_dir_all(&old_add).unwrap();
+        set_mtime_past(&old_add, Duration::from_secs(11 * 60));
+
+        // Create a fresh staging dir that should NOT be removed
+        let fresh_upgrade = staging.join("marketplace-upgrade-cccccc");
+        fs::create_dir_all(&fresh_upgrade).unwrap();
+
+        // Create an unrelated dir that should NOT be removed
+        let unrelated = staging.join("other-dir");
+        fs::create_dir_all(&unrelated).unwrap();
+
+        remove_stale_marketplace_temp_dirs(install_root.path());
+
+        assert!(!old_upgrade.exists(), "old upgrade dir should be removed");
+        assert!(!old_add.exists(), "old add dir should be removed");
+        assert!(
+            fresh_upgrade.exists(),
+            "fresh upgrade dir should be preserved"
+        );
+        assert!(unrelated.exists(), "unrelated dir should be preserved");
+    }
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_removes_old_backup_dirs() {
+        let install_root = TempDir::new().unwrap();
+
+        let old_backup = install_root.path().join("marketplace-backup-xxxxxx");
+        fs::create_dir_all(&old_backup).unwrap();
+        set_mtime_past(&old_backup, Duration::from_secs(11 * 60));
+
+        let fresh_backup = install_root.path().join("marketplace-backup-yyyyyy");
+        fs::create_dir_all(&fresh_backup).unwrap();
+
+        // A normal installed marketplace dir should not be touched
+        let normal_dir = install_root.path().join("my-marketplace");
+        fs::create_dir_all(&normal_dir).unwrap();
+
+        remove_stale_marketplace_temp_dirs(install_root.path());
+
+        assert!(!old_backup.exists(), "old backup dir should be removed");
+        assert!(
+            fresh_backup.exists(),
+            "fresh backup dir should be preserved"
+        );
+        assert!(normal_dir.exists(), "normal dir should be preserved");
+    }
+
+    #[test]
+    fn remove_stale_marketplace_temp_dirs_noop_when_no_staging_dir() {
+        let install_root = TempDir::new().unwrap();
+        // No .staging dir exists — should not panic
+        remove_stale_marketplace_temp_dirs(install_root.path());
+    }
+
+    /// Set a directory's mtime to `duration` in the past.
+    fn set_mtime_past(path: &Path, duration: Duration) {
+        let secs = duration.as_secs();
+        let status = std::process::Command::new("touch")
+            .arg(format!("-d@{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(secs)))
+            .arg(path)
+            .status()
+            .expect("touch command failed");
+        assert!(status.success(), "touch should succeed");
+    }
+}
